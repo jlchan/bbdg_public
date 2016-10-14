@@ -1,9 +1,7 @@
-# --------------------------------------------------------------
 # BBDG: a Bernstein-Bezier Discontinuous Galerkin solver for CPUs or GPUs
 # Copyright (c) 2016, Jesse Chan, Tim Warburton
 # https://github.com/jlchan/bbdg_public
 # BBDG is released under the GPL lesser public license. see license.bbdg for details.
-# --------------------------------------------------------------
 
 BBDG is based on the Matlab codes of "Nodal Discontinuous Galerkin Methods" by Jan Hesthaven and Tim Warburton, as well as the MIDG code of Tim Warburton.
 
