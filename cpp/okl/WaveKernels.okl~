@@ -1,0 +1,909 @@
+#define NGEO   (p_Nvgeo+p_Nfgeo*Nfaces) // number of geofacs
+#define ddot4(a,b)  a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w
+
+// defined in WaveOKL3d (initWave3d)
+#if USE_DOUBLE
+#define dfloat double
+#define dfloat4 double4
+#else
+#define dfloat float
+#define dfloat4 float4
+#endif
+
+//  =============== RK first order DG kernels ===============
+
+kernel void rk_volume(const    int K,
+		      const dfloat * restrict vgeo,
+		      const dfloat * restrict Dr,
+		      const dfloat * restrict Ds,
+		      const dfloat * restrict Dt,
+		      const dfloat * restrict Q,
+		      dfloat * restrict rhsQ){
+
+  // loop over elements
+  for(int k1=0; k1<(K+p_KblkV-1)/p_KblkV; ++k1; outer0){
+
+    // total shared memory amounts to approx. 4 dfloats per thread
+    shared dfloat sp[p_KblkV][p_Np];
+    shared dfloat sUr[p_KblkV][p_Np], sUs[p_KblkV][p_Np], sUt[p_KblkV][p_Np];
+    shared dfloat sG[p_KblkV][p_Nvgeo];
+
+    // lapp has to survive multiple inner loops
+    for(int k2 = 0; k2 < p_KblkV; ++k2; inner1){
+      for(int n=0;n<p_Np;++n;inner0){
+	int k = k1*p_KblkV + k2;
+	if (k < K){
+
+          // load geometric factors into shared memory
+          int m = n;
+          while(m<p_Nvgeo){
+            sG[k2][m] = vgeo[m+p_Nvgeo*k];
+            m += p_Np;
+          }
+        }
+      }
+    }
+    barrier(localMemFence);
+
+#define rx sG[k2][0]
+#define ry sG[k2][1]
+#define rz sG[k2][2]
+#define sx sG[k2][3]
+#define sy sG[k2][4]
+#define sz sG[k2][5]
+#define tx sG[k2][6]
+#define ty sG[k2][7]
+#define tz sG[k2][8]
+
+    for(int k2 = 0; k2 < p_KblkV; ++k2; inner1){
+      // loop over nodes
+      for(int n=0;n<p_Np;++n;inner0){
+	int k = k1*p_KblkV + k2;
+	if (k < K){
+
+          // load p into shared memory for element k
+	  int offset = 0;
+	  const int id = n + k*p_Np*p_Nfields;
+	  sp[k2][n] = Q[id + offset]; offset += p_Np;
+	  const dfloat un = Q[id + offset]; offset += p_Np;
+	  const dfloat vn = Q[id + offset]; offset += p_Np;
+	  const dfloat wn = Q[id + offset];
+
+          sUr[k2][n] = un*rx + vn*ry + wn*rz;  // should store drdx*u + drdy*v +drdz*w
+          sUs[k2][n] = un*sx + vn*sy + wn*sz;  // should store dsdx*u + dsdy*v +dsdz*w
+          sUt[k2][n] = un*tx + vn*ty + wn*tz;  // should store dtdx*u + dtdy*v +dtdz*w
+
+	}
+      }
+    }
+    barrier(localMemFence);
+
+    for(int k2 = 0; k2 < p_KblkV; ++k2; inner1){
+      // loop over nodes
+      for(int n=0;n<p_Np;++n;inner0){
+	int k = k1*p_KblkV + k2;
+	if (k < K){
+
+          dfloat dpdr = 0, dpds = 0, dpdt = 0, divU = 0;
+
+	  // diff
+	  //	  occaUnroll(p_Np)
+	  for(int m=0;m<p_Np;++m){ // ILP
+
+	    const dfloat Dr_m = Dr[n+m*p_Np];
+	    const dfloat Ds_m = Ds[n+m*p_Np];
+	    const dfloat Dt_m = Dt[n+m*p_Np];
+
+            const dfloat pm = sp[k2][m];
+            dpdr += Dr_m*pm;
+            dpds += Ds_m*pm;
+            dpdt += Dt_m*pm;
+            divU += Dr_m*sUr[k2][m];
+            divU += Ds_m*sUs[k2][m];
+            divU += Dt_m*sUt[k2][m];
+          }
+
+          // GFLOPS: 15 * p_Np
+          dfloat dpdx = rx*dpdr + sx*dpds + tx*dpdt;
+          dfloat dpdy = ry*dpdr + sy*dpds + ty*dpdt;
+          dfloat dpdz = rz*dpdr + sz*dpds + tz*dpdt;
+
+          int id = n + k*p_Nfields*p_Np;
+          rhsQ[id] = -divU; id += p_Np;
+          rhsQ[id] = -dpdx; id += p_Np;
+          rhsQ[id] = -dpdy; id += p_Np;
+          rhsQ[id] = -dpdz;
+
+        }
+      }
+    }
+
+  }
+}
+
+// split part of kernel
+kernel void rk_surface(const    int K,
+		       const dfloat * restrict fgeo,
+		       const    int * restrict Fmask,
+		       const    int * restrict vmapP,
+		       const dfloat * restrict LIFT,
+		       const dfloat * restrict Q,
+		       dfloat * restrict rhsQ){
+
+  // loop over elements
+  for(int k1=0;k1<(K+p_KblkS-1)/p_KblkS;++k1;outer0){
+
+    // total shared memory amounts to approx. 4 dfloats per thread
+    shared dfloat s_pflux[p_KblkS][p_NfpNfaces];
+    shared dfloat s_Uflux[p_KblkS][p_NfpNfaces];
+
+    shared dfloat s_nxyz[p_KblkS][3*p_Nfaces];
+    //exclusive int nx, ny, nz;
+
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_T;++n;inner0){
+	int k = k1*p_KblkS + k2;
+
+	if (k < K){
+          // retrieve traces (should move earlier)
+          if(n<p_NfpNfaces){
+
+            const int f = n/p_Nfp;
+
+	    const int fid = Fmask[n];
+            int idM = fid + k*p_Np*p_Nfields;
+            int idP = vmapP[n + k*p_NfpNfaces];
+	    const int isBoundary = idM==idP;
+
+            int id = f*p_Nfgeo + p_Nfgeo*p_Nfaces*k;
+	    const dfloat Fscale = fgeo[id];
+	    const dfloat nx = fgeo[id+1];
+	    const dfloat ny = fgeo[id+2];
+	    const dfloat nz = fgeo[id+3];
+	    int foff = 3*f;
+	    s_nxyz[k2][foff] = nx; foff++;
+	    s_nxyz[k2][foff] = ny; foff++;
+	    s_nxyz[k2][foff] = nz;
+
+	    const dfloat pM = Q[idM]; idM += p_Np;
+	    const dfloat uM = Q[idM]; idM += p_Np;
+	    const dfloat vM = Q[idM]; idM += p_Np;
+	    const dfloat wM = Q[idM];
+
+	    const dfloat pP = Q[idP]; idP += p_Np;
+	    const dfloat uP = Q[idP]; idP += p_Np;
+	    const dfloat vP = Q[idP]; idP += p_Np;
+	    const dfloat wP = Q[idP];
+
+            dfloat pjump = pP-pM;
+            dfloat Unjump = (uP-uM)*nx + (vP-vM)*ny + (wP-wM)*nz;
+	    if (isBoundary){
+	      pjump = -2.f*pM;
+	      Unjump = 0.f;
+	    }
+	    s_pflux[k2][n] = .5f*(pjump - Unjump)*Fscale;
+	    s_Uflux[k2][n] = .5f*(Unjump - pjump)*Fscale;
+
+          }
+        }
+      }
+    }
+    barrier(localMemFence);
+
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_T;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+	if (k < K){
+          if(n<p_Np){
+
+            // accumulate lift/normal lift contributions
+	    dfloat val1 = 0.f, val2 = 0.f, val3 = 0.f, val4 = 0.f;
+
+	    //occaUnroll(p_NfpNfaces)
+            for(int m=0;m<p_NfpNfaces;++m){
+              const dfloat Lnm = LIFT[n+m*p_Np];
+
+              // dv/dn testing
+              const int fm = (m/p_Nfp);
+              const dfloat dfm = s_Uflux[k2][m];
+
+              // v testing
+              val1 += Lnm*s_pflux[k2][m];
+              val2 += Lnm*dfm*s_nxyz[k2][3*fm];
+              val3 += Lnm*dfm*s_nxyz[k2][1+3*fm];
+              val4 += Lnm*dfm*s_nxyz[k2][2+3*fm];
+            }
+
+	    int id = n + k*p_Nfields*p_Np;
+	    rhsQ[id] += val1; id += p_Np;
+	    rhsQ[id] += val2; id += p_Np;
+	    rhsQ[id] += val3; id += p_Np;
+	    rhsQ[id] += val4;
+
+          }
+        }
+      }
+    }
+  }
+}
+
+kernel void rk_update(const int K,
+		      const dfloat fa,
+		      const dfloat fb,
+		      const dfloat fdt,
+		      const dfloat * restrict rhsQ,
+		      dfloat * restrict resQ,
+		      dfloat * restrict Q){
+
+  for(int k1=0; k1<(K+p_KblkU-1)/p_KblkU; ++k1; outer0){
+
+    // lapp has to survive multiple inner loops
+    for(int k2 = 0; k2 < p_KblkU; ++k2; inner1){
+      for(int n=0;n<p_Np;++n;inner0){
+
+	int k = k1*p_KblkU + k2;
+	if (k < K){
+
+	  int id = n + k*p_Np*p_Nfields;
+	  dfloat rhs,res;
+
+	  rhs = rhsQ[id];
+	  res = resQ[id];
+	  res = fa*res + fdt*rhs;
+	  resQ[id] = res;
+	  Q[id]   += fb*res;
+	  id += p_Np;
+
+	  rhs = rhsQ[id];
+	  res = resQ[id];
+	  res = fa*res + fdt*rhs;
+	  resQ[id] = res;
+	  Q[id]   += fb*res;
+	  id += p_Np;
+
+	  rhs = rhsQ[id]; res = resQ[id];
+	  res = fa*res + fdt*rhs;
+	  resQ[id] = res;
+	  Q[id]   += fb*res;
+	  id += p_Np;
+
+	  rhs = rhsQ[id];
+	  res = resQ[id];
+	  res = fa*res + fdt*rhs;
+	  resQ[id] = res;
+	  Q[id]   += fb*res;
+
+	}
+      }
+    }
+
+  }
+}
+
+
+kernel void rk_update_Ntotal(const int Ntotal,
+			     const dfloat fa,
+			     const dfloat fb,
+			     const dfloat fdt,
+			     const dfloat * restrict rhsQ,
+			     dfloat * restrict resQ,
+			     dfloat * restrict Q){
+
+#define p_BLK 256
+
+  for(int block=0;block<Ntotal;block+=p_BLK;outer0){
+    for(int n=block;n<block+p_BLK;++n;inner0){
+
+      if(n<Ntotal){
+	const float rhs = rhsQ[n];
+	float res = resQ[n];
+	res = fa*res + fdt*rhs;
+
+	resQ[n] = res;
+	Q[n]   += fb*res;
+      }
+    }
+  }
+}
+
+
+// ============================== bernstein kernels ==============================
+
+kernel void rk_volume_bern(const    int K,
+			   const dfloat * restrict vgeo,
+			   const int4 * restrict D1_ids,
+			   const int4 * restrict D2_ids,
+			   const int4 * restrict D3_ids,
+			   const int4 * restrict D4_ids,
+			   const dfloat4 * restrict Dvals,
+			   const dfloat * restrict Q,
+			   dfloat * restrict rhsQ){
+
+  // loop over elements
+  for(int k1=0; k1<(K+p_KblkV-1)/p_KblkV; ++k1; outer0){
+
+    // total shared memory amounts to approx. 4 dfloats per thread
+    shared dfloat sp[p_KblkV][p_Np];
+    shared dfloat sUr[p_KblkV][p_Np], sUs[p_KblkV][p_Np], sUt[p_KblkV][p_Np];
+    shared dfloat sG[p_KblkV][p_Nvgeo];
+
+    exclusive dfloat Dval1,Dval2,Dval3,Dval4;
+    //    exclusive int D1i,D1j,D1k,D1l;
+    //    exclusive int D2i,D2j,D2k,D2l;
+    //    exclusive int D3i,D3j,D3k,D3l;
+    //    exclusive int D4i,D4j,D4k,D4l;
+
+    // lapp has to survive multiple inner loops
+    for(int k2 = 0; k2 < p_KblkV; ++k2; inner1){
+      for(int n=0;n<p_Np;++n;inner0){
+	int k = k1*p_KblkV + k2;
+	if (k < K){
+
+          // load geometric factors into shared memory
+          int m = n;
+          while(m<p_Nvgeo){
+            sG[k2][m] = vgeo[m+p_Nvgeo*k];
+            m += p_Np;
+          }
+
+          // load deriv operators into register
+	  const dfloat4 Dvali = Dvals[n];
+	  Dval1 = Dvali.x; Dval2 = Dvali.y; Dval3 = Dvali.z; Dval4 = Dvali.w;
+
+        }
+      }
+    }
+    barrier(localMemFence);
+
+#define rx sG[k2][0]
+#define ry sG[k2][1]
+#define rz sG[k2][2]
+#define sx sG[k2][3]
+#define sy sG[k2][4]
+#define sz sG[k2][5]
+#define tx sG[k2][6]
+#define ty sG[k2][7]
+#define tz sG[k2][8]
+
+    for(int k2 = 0; k2 < p_KblkV; ++k2; inner1){
+      // loop over nodes
+      for(int n=0;n<p_Np;++n;inner0){
+	int k = k1*p_KblkV + k2;
+	if (k < K){
+
+          // load p into shared memory for element k
+	  int offset = 0;
+	  const int id = n + k*p_Np*p_Nfields;
+	  sp[k2][n] = Q[id + offset]; offset += p_Np;
+	  const dfloat un = Q[id + offset]; offset += p_Np;
+	  const dfloat vn = Q[id + offset]; offset += p_Np;
+	  const dfloat wn = Q[id + offset];
+
+          sUr[k2][n] = un*rx + vn*ry + wn*rz;  // should store drdx*u + drdy*v +drdz*w
+          sUs[k2][n] = un*sx + vn*sy + wn*sz;  // should store dsdx*u + dsdy*v +dsdz*w
+          sUt[k2][n] = un*tx + vn*ty + wn*tz;  // should store dtdx*u + dtdy*v +dtdz*w
+
+	}
+      }
+    }
+    barrier(localMemFence);
+
+    for(int k2 = 0; k2 < p_KblkV; ++k2; inner1){
+      // loop over nodes
+      for(int n=0;n<p_Np;++n;inner0){
+	int k = k1*p_KblkV + k2;
+	if (k < K){
+
+          // to speed up slightly, exploit ILP in reading ids
+	  const int4 D1i = D1_ids[n];
+ 	  const int4 D2i = D2_ids[n];
+	  const int4 D3i = D3_ids[n];
+	  const int4 D4i = D4_ids[n];
+
+	  const dfloat p1 = Dval1*sp[k2][D1i.x] + Dval2*sp[k2][D2i.x] + Dval3*sp[k2][D3i.x] + Dval4*sp[k2][D4i.x];
+	  const dfloat p2 = Dval1*sp[k2][D1i.y] + Dval2*sp[k2][D2i.y] + Dval3*sp[k2][D3i.y] + Dval4*sp[k2][D4i.y];
+	  const dfloat p3 = Dval1*sp[k2][D1i.z] + Dval2*sp[k2][D2i.z] + Dval3*sp[k2][D3i.z] + Dval4*sp[k2][D4i.z];
+	  const dfloat p4 = Dval1*sp[k2][D1i.w] + Dval2*sp[k2][D2i.w] + Dval3*sp[k2][D3i.w] + Dval4*sp[k2][D4i.w];
+
+          // divU = Dr*Ur + Ds*Us + Dt*Ut
+	  //     = .5*((Ur2-Ur1) + (Us3-Us1) + (Ut4-Ut1));
+	  //     = .5*((Ur2 + Us3 + Ut4) - (Ur1 + Us1 + Ut1))
+	  //     = .5*(dU1 - dU2)
+	  dfloat dU1  = Dval1*( sUr[k2][D1i.y] + sUs[k2][D1i.z] + sUt[k2][D1i.w]);
+	  dU1 += Dval2*( sUr[k2][D2i.y] + sUs[k2][D2i.z] + sUt[k2][D2i.w]);
+	  dU1 += Dval3*( sUr[k2][D3i.y] + sUs[k2][D3i.z] + sUt[k2][D3i.w]);
+	  dU1 += Dval4*( sUr[k2][D4i.y] + sUs[k2][D4i.z] + sUt[k2][D4i.w]);
+
+	  dfloat dU2  = Dval1*( sUr[k2][D1i.x] + sUs[k2][D1i.x] + sUt[k2][D1i.x]);
+	  dU2 += Dval2*( sUr[k2][D2i.x] + sUs[k2][D2i.x] + sUt[k2][D2i.x]);
+	  dU2 += Dval3*( sUr[k2][D3i.x] + sUs[k2][D3i.x] + sUt[k2][D3i.x]);
+	  dU2 += Dval4*( sUr[k2][D4i.x] + sUs[k2][D4i.x] + sUt[k2][D4i.x]);
+
+	  const dfloat dpdr = .5f*(p2-p1);
+	  const dfloat dpds = .5f*(p3-p1);
+	  const dfloat dpdt = .5f*(p4-p1);
+	  const dfloat divU = .5f*(dU1-dU2);
+
+          // GFLOPS: 15 * p_Np
+          dfloat dpdx = rx*dpdr + sx*dpds + tx*dpdt;
+          dfloat dpdy = ry*dpdr + sy*dpds + ty*dpdt;
+          dfloat dpdz = rz*dpdr + sz*dpds + tz*dpdt;
+
+          int id = n + k*p_Nfields*p_Np;
+          rhsQ[id] = -divU; id += p_Np;
+          rhsQ[id] = -dpdx; id += p_Np;
+          rhsQ[id] = -dpdy; id += p_Np;
+          rhsQ[id] = -dpdz;
+
+        }
+      }
+    }
+
+  }
+}
+
+
+
+// treat EEL as sparse matrix
+kernel void rk_surface_bern(const    int K,
+			    const dfloat * restrict fgeo,
+			    const    int * restrict Fmask,
+			    const    int * restrict vmapP,
+			    const    int4 * restrict slice_ids,
+			    const    int * restrict EEL_ids,
+			    const dfloat * restrict EEL_vals,
+			    const    int * restrict L0_ids,
+			    const dfloat * restrict L0_vals,
+			    const dfloat * restrict cEL,
+			    const dfloat * restrict Q,
+			    dfloat * restrict rhsQ){
+
+  // loop over elements
+  for(int k1=0;k1<(K+p_KblkS-1)/p_KblkS;++k1;outer0){
+
+    // total shared memory amounts to approx. 4 dfloats per thread
+    shared dfloat s_pflux[p_KblkS][p_NfpNfaces];
+    shared dfloat s_Uflux[p_KblkS][p_NfpNfaces];
+    shared dfloat s_ptmp[p_KblkS][p_NfpNfaces];
+    shared dfloat s_Utmp[p_KblkS][p_NfpNfaces];
+
+    shared dfloat s_nxyz[p_KblkS][4*p_Nfaces];
+
+    exclusive int f, nt;
+
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_T;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+
+	if (k < K && n < p_Nfaces){
+	  int id = n*p_Nfgeo + p_Nfgeo*p_Nfaces*k;
+	  const dfloat Fscale = fgeo[id];
+	  const dfloat nx = fgeo[id+1];
+	  const dfloat ny = fgeo[id+2];
+	  const dfloat nz = fgeo[id+3];
+	  int foff = 4*n;
+	  s_nxyz[k2][foff] = nx; foff++;
+	  s_nxyz[k2][foff] = ny; foff++;
+	  s_nxyz[k2][foff] = nz; foff++;
+	  s_nxyz[k2][foff] = Fscale;
+        }
+
+	f = n / p_Nfp;
+	nt = n % p_Nfp;
+      }
+    }
+
+    barrier(localMemFence);
+
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_T;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+
+	if (k < K && n < p_NfpNfaces){
+
+	  // compute fluxes
+	  const int fid = Fmask[n];
+	  int idM = fid + k*p_Np*p_Nfields;
+	  int idP = vmapP[n + k*p_NfpNfaces];
+	  const int isBoundary = idM==idP;
+
+	  //const dfloat4 QM4 = Q4[idM];
+	  const dfloat pM = Q[idM]; idM += p_Np;
+	  const dfloat uM = Q[idM]; idM += p_Np;
+	  const dfloat vM = Q[idM]; idM += p_Np;
+	  const dfloat wM = Q[idM];
+
+	  //const dfloat4 QP4 = Q4[idP];
+	  const dfloat pP = Q[idP]; idP += p_Np;
+	  const dfloat uP = Q[idP]; idP += p_Np;
+	  const dfloat vP = Q[idP]; idP += p_Np;
+	  const dfloat wP = Q[idP];
+
+	  const int foff = 4*f;
+	  dfloat pjump = pP-pM;
+	  dfloat Unjump =
+	    (uP-uM)*s_nxyz[k2][0 + foff] +
+	    (vP-vM)*s_nxyz[k2][1 + foff] +
+	    (wP-wM)*s_nxyz[k2][2 + foff];
+
+	  if (isBoundary){
+	    pjump = -2.f*pM;
+	    Unjump = 0.f;
+	  }
+	  const dfloat Fscale = s_nxyz[k2][3 + foff];
+	  s_pflux[k2][n] = .5f*(pjump - Unjump)*Fscale;
+	  s_Uflux[k2][n] = .5f*(Unjump - pjump)*Fscale;
+
+        }
+      }
+    }
+
+    barrier(localMemFence);
+
+    // apply L0 dense - loop over faces, reuse operator
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_T;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+	if (k < K && n < p_NfpNfaces){
+
+	  dfloat val1 = 0.f, val2 = 0.f;
+	  for(int j = 0; j < p_L0_nnz; ++j){
+
+	    const dfloat L0_j = L0_vals[nt + j*p_Nfp];
+	    int id = L0_ids[nt+j*p_Nfp] + f*p_Nfp;
+
+	    // manually unroll over faces
+	    val1 += L0_j*s_pflux[k2][id];
+	    val2 += L0_j*s_Uflux[k2][id];
+	  }
+
+	  s_ptmp[k2][n] = val1;
+	  s_Utmp[k2][n] = val2;
+
+	}
+      }
+    }
+    barrier(localMemFence);
+
+    // apply sparse EEL matrix
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_T;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+	if (k < K && n < p_Np){
+
+	  int id = n + k*p_Np*p_Nfields;
+	  dfloat val1 = rhsQ[id]; id += p_Np;
+	  dfloat val2 = rhsQ[id]; id += p_Np;
+	  dfloat val3 = rhsQ[id]; id += p_Np;
+	  dfloat val4 = rhsQ[id];
+
+	  for(int j = 0; j < p_EEL_nnz; ++j){
+
+	    const int col_id = EEL_ids[n + j*p_Np];
+	    const dfloat EEL_val = EEL_vals[n + j*p_Np];
+
+	    const int fcol = col_id/p_Nfp;
+	    const dfloat Uf = s_Utmp[k2][col_id];
+
+	    const int foff = 4*fcol;
+	    val1 += EEL_val*s_ptmp[k2][col_id];
+	    val2 += EEL_val*Uf*s_nxyz[k2][  foff];
+	    val3 += EEL_val*Uf*s_nxyz[k2][1+foff];
+	    val4 += EEL_val*Uf*s_nxyz[k2][2+foff];
+
+	  }
+
+	  id = n + k*p_Np*p_Nfields;
+	  rhsQ[id] = val1; id += p_Np;
+	  rhsQ[id] = val2; id += p_Np;
+	  rhsQ[id] = val3; id += p_Np;
+	  rhsQ[id] = val4;
+	  //rhsQ4n.x += val1;
+	  //rhsQ4n.y += val2;
+	  //rhsQ4n.z += val3;
+	  //rhsQ4n.w += val4;
+	  //rhsQ4[id] = rhsQ4n;
+
+	}
+      }
+    }
+
+  }
+}
+
+// trying slice-by-slice LIFT application.
+// loads in sparse matrix data for each slice
+// treats EEL as an operator, applies in O(N^d) complexity
+kernel void rk_surface_bern_slice(const    int K,
+				  const dfloat * restrict fgeo,
+				  const    int * restrict Fmask,
+				  const    int * restrict vmapP,
+				  const   int4 * restrict slice_ids,
+				  const    int * restrict EEL_ids,
+				  const dfloat * restrict EEL_vals,
+				  const    int * restrict L0_ids,
+				  const dfloat * restrict L0_vals,
+				  const dfloat * restrict cEL,
+				  const dfloat * restrict Q,
+				  dfloat * restrict rhsQ){
+
+  // loop over elements
+  for(int k1=0;k1<(K+p_KblkS-1)/p_KblkS;++k1;outer0){
+
+    // two arrays - one to store
+    shared dfloat s_pflux[p_KblkS][2][p_NfpNfaces]; // stores flux
+    shared dfloat s_Uflux[p_KblkS][2][p_NfpNfaces]; // stores flux
+    shared dfloat s_tmp[p_KblkS][4][p_Np]; // for rhs storage
+
+    shared dfloat s_cEL[p_N+1]; // scaling coefficients for EEL
+
+    shared dfloat s_nxyz[p_KblkS][4*p_Nfaces];
+
+    exclusive unsigned int slice_offset1;
+    exclusive unsigned int slice_offset2;
+
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_Nfp;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+
+	if (k < K){
+
+	  if (n < p_N+1){
+	    s_cEL[n] = cEL[n]; // scaling factor for EEL
+	  }
+
+	  int f = n;
+          while (f < p_Nfaces){
+
+            int id = f*p_Nfgeo + p_Nfgeo*p_Nfaces*k;
+            const dfloat Fscale = fgeo[id];
+            const dfloat nx = fgeo[id+1];
+            const dfloat ny = fgeo[id+2];
+            const dfloat nz = fgeo[id+3];
+            int foff = 4*f;
+            s_nxyz[k2][foff] = nx; foff++;
+            s_nxyz[k2][foff] = ny; foff++;
+            s_nxyz[k2][foff] = nz; foff++;
+            s_nxyz[k2][foff] = Fscale;
+
+	    f += p_Nfp;
+          }
+
+	  // initialize rhs accumulator
+	  int m = n;
+	  while (m < p_Np){
+	    int id = m + k*p_Np*p_Nfields;
+	    s_tmp[k2][0][m] = rhsQ[id]; id += p_Np;
+	    s_tmp[k2][1][m] = rhsQ[id]; id += p_Np;
+	    s_tmp[k2][2][m] = rhsQ[id]; id += p_Np;
+	    s_tmp[k2][3][m] = rhsQ[id];
+
+	    m += p_Nfp;
+	  }
+
+	  slice_offset1 = 0;
+	  slice_offset2 = 0;
+
+        }
+      }
+    }
+
+    barrier(localMemFence);
+
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_Nfp;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+
+	if (k < K){
+
+	  // compute fluxes
+          for(int f=0;f<p_Nfaces;++f){
+            int m = n + f*p_Nfp;
+	    const int fid = Fmask[m];
+            int idM = fid + k*p_Np*p_Nfields;
+            int idP = vmapP[m + k*p_NfpNfaces];
+	    const int isBoundary = idM==idP;
+
+	    //const dfloat4 QM4 = Q4[idM];
+	    const dfloat pM = Q[idM]; idM += p_Np;
+	    const dfloat uM = Q[idM]; idM += p_Np;
+	    const dfloat vM = Q[idM]; idM += p_Np;
+	    const dfloat wM = Q[idM];
+
+	    //const dfloat4 QP4 = Q4[idP];
+	    const dfloat pP = Q[idP]; idP += p_Np;
+	    const dfloat uP = Q[idP]; idP += p_Np;
+	    const dfloat vP = Q[idP]; idP += p_Np;
+	    const dfloat wP = Q[idP];
+
+            dfloat pjump = pP-pM;
+	    const int foff = 4*f;
+            dfloat Unjump =
+              (uP-uM)*s_nxyz[k2][0 + foff] +
+              (vP-vM)*s_nxyz[k2][1 + foff] +
+              (wP-wM)*s_nxyz[k2][2 + foff];
+
+	    if (isBoundary){
+	      pjump = -2.f*pM;
+	      Unjump = 0.f;
+	    }
+	    const dfloat Fscale = s_nxyz[k2][3 + foff];
+	    s_pflux[k2][0][m] = .5f*(pjump - Unjump)*Fscale;
+	    s_Uflux[k2][0][m] = .5f*(Unjump - pjump)*Fscale;
+
+          }
+
+        }
+      }
+    }
+
+    barrier(localMemFence);
+
+
+    // apply L0 sparsely - loop over faces, reuse operator
+    for(int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(int n=0;n<p_Nfp;++n;inner0){
+
+	int k = k1*p_KblkS + k2;
+	if (k < K){
+	  dfloat val1[p_Nfaces], val2[p_Nfaces];
+          occaUnroll(p_Nfaces)
+	  for (int f = 0; f < p_Nfaces; ++f){
+	    val1[f] = 0.f; val2[f] = 0.f;
+	  }
+	  // apply L0 * reshape(p,Nfp,Nfaces)
+          occaUnroll(p_L0_nnz)
+	  for(int j = 0; j < p_L0_nnz; ++j){
+	    const dfloat L0_j = L0_vals[n + j*p_Nfp];
+	    int id = L0_ids[n+j*p_Nfp];	    
+	    for (int f = 0; f < p_Nfaces; ++f){
+	      val1[f] += L0_j*s_pflux[k2][0][id];
+	      val2[f] += L0_j*s_Uflux[k2][0][id];
+	      id += p_Nfp;
+	    }
+	  }
+	  // write to empty spots in memory for degree reduction
+	  int id = n;
+          occaUnroll(p_Nfaces)
+	  for (int f = 0; f < p_Nfaces; ++f){
+	    s_pflux[k2][1][id] = val1[f];
+	    s_Uflux[k2][1][id] = val2[f];
+	    id += p_Nfp;
+	  }
+
+	} // if k < K
+      }
+    }
+
+    barrier(localMemFence);
+
+    // propagate changes through remaining slices
+    for (unsigned int slice = 0; slice < p_N+1; ++slice){
+
+      for(unsigned int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+	for(unsigned int n=0;n<p_Nfp;++n;inner0){
+
+	  unsigned int k = k1*p_KblkS + k2;
+	  if (k < K){
+
+	    const unsigned int N_slice  = p_N-slice;
+	    const unsigned int Np_slice = ((N_slice + 1)*(N_slice + 2)) >> 1; // face nodes
+
+	    // if slice = odd, read from index 0, write to index 1.
+	    // if slice = even, read from index 1, write to index 0.
+	    const unsigned int swap_write = slice & 1;
+	    const unsigned int swap_read = !swap_write; // 1-swap_write;
+
+	    // compute degree reduction output for each node
+	    if ( n < Np_slice ){
+
+	      // prefetch ids
+	      const unsigned int fid = n + slice_offset1;
+	      const int4 slice_ids4 = slice_ids[fid];
+	      slice_offset1 += Np_slice;  // increment for next slice
+
+	      unsigned int id1,id2,id3;
+	      dfloat a,b,c;
+	      if (slice > 0){
+		unsigned int id = n + slice_offset2;
+		// first "column" of packed val/id arrays
+		a = EEL_vals[id]; id1 = EEL_ids[id]; id += Np_slice;
+		b = EEL_vals[id]; id2 = EEL_ids[id]; id += Np_slice;
+		c = EEL_vals[id]; id3 = EEL_ids[id];
+		slice_offset2 += Np_slice * 3; // increment for sparse arrays
+	      } //slice > 0
+
+	      // load prefetched data
+	      unsigned int vol_ids[p_Nfaces];
+	      vol_ids[0] = slice_ids4.x;
+	      vol_ids[1] = slice_ids4.y;
+	      vol_ids[2] = slice_ids4.z;
+	      vol_ids[3] = slice_ids4.w;
+
+	      dfloat reduced_p = 0.f, reduced_U = 0.f;
+	      for (unsigned int f = 0; f < p_Nfaces; ++f){
+		const unsigned int vol_id = vol_ids[f];
+
+		//if (slice==0){ // reduction = identity
+		reduced_p = s_pflux[k2][1][n + f*p_Nfp];
+		reduced_U = s_Uflux[k2][1][n + f*p_Nfp];
+
+		if (slice>0){
+
+		  // do degree reduction for each face
+		  reduced_p =
+		    a * s_pflux[k2][swap_read][id1] +
+		    b * s_pflux[k2][swap_read][id2] +
+		    c * s_pflux[k2][swap_read][id3];
+
+		  reduced_U =
+		    a * s_Uflux[k2][swap_read][id1] +
+		    b * s_Uflux[k2][swap_read][id2] +
+		    c * s_Uflux[k2][swap_read][id3];
+
+		  // update ids for next face
+		  id1 += p_Nfp; id2 += p_Nfp; id3 += p_Nfp;
+
+		} // if slice > 0
+
+		// write out to alternating storage for next slice
+		s_pflux[k2][swap_write][n + f*p_Nfp] = reduced_p;
+		s_Uflux[k2][swap_write][n + f*p_Nfp] = reduced_U;
+
+		// scale by coeffs for write to RHS later
+		const dfloat cEL_slice = s_cEL[slice];
+		reduced_p *= cEL_slice;
+		reduced_U *= cEL_slice;
+
+		const int foff = 4*f;
+		s_tmp[k2][0][vol_id] += reduced_p;
+		s_tmp[k2][1][vol_id] += reduced_U*s_nxyz[k2][0 + foff];
+		s_tmp[k2][2][vol_id] += reduced_U*s_nxyz[k2][1 + foff];
+		s_tmp[k2][3][vol_id] += reduced_U*s_nxyz[k2][2 + foff];
+
+	      } // loop over f
+
+	    } // if n < Np_slice
+	  } // if k < K
+
+	} // inner loop over n
+      } // inner loop over kblk
+
+      barrier(localMemFence); // sync up after each slice
+
+    } // loop over slice
+
+
+    // write results out to global mem
+    for(unsigned int k2 = 0; k2 < p_KblkS; ++k2; inner1){
+      for(unsigned int n = 0; n < p_Nfp; ++n; inner0){
+
+	unsigned int k = k1*p_KblkS + k2;
+	if (k < K){
+
+	  unsigned int m = n;
+	  while(m < p_Np){
+
+	    int id = m + k*p_Np*p_Nfields;
+	    rhsQ[id] = s_tmp[k2][0][m]; id += p_Np;
+	    rhsQ[id] = s_tmp[k2][1][m]; id += p_Np;
+	    rhsQ[id] = s_tmp[k2][2][m]; id += p_Np;
+	    rhsQ[id] = s_tmp[k2][3][m];
+
+	    m += p_Nfp;
+
+	  }
+
+	}
+      }
+    } // innerk
+
+  }
+}

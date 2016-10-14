@@ -1,0 +1,25 @@
+rm blockTimings.txt
+touch blockTimings.txt
+
+for ((N=1; N<=9; N++))
+do
+    make clean; make N=$N -j bern;
+
+    # change maxblock sizes based on maxthreads = 1024
+    if ((N<=5))
+    then
+        echo "Setting maxblk = 10"
+        maxBlk=10
+    else
+        echo "Setting maxblk = 6"
+        maxBlk=6
+    fi
+
+    for ((Kblk=1; Kblk<=maxBlk; Kblk++))
+    do
+        echo N=$N, KblkV= $Kblk
+        ./main_bern meshes/cube6.msh .1 $Kblk $Kblk $Kblk 
+    done
+    printf '\n' >> blockTimings.txt
+done
+
