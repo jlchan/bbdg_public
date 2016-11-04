@@ -3,7 +3,7 @@
 ## https://github.com/jlchan/bbdg_public
 ## BBDG is released under the GPL lesser public license. see license.bbdg for details.
 
-BBDG is based on the Matlab codes of "Nodal Discontinuous Galerkin Methods" by Jan Hesthaven and Tim Warburton, as well as the MIDG code of Tim Warburton. The implementation is based on the approach outlined in arxiv.org/abs/1512.06025. 
+BBDG is based on the Matlab codes of "Nodal Discontinuous Galerkin Methods" by Jan Hesthaven and Tim Warburton, as well as the MIDG code of Tim Warburton. The implementation is based on the approach outlined in (arxiv.org/abs/1512.06025). 
 
 BBDG is built with Eigen 3.2.8 (most recent stable version as of Feb 16, 2016), which is included in this repository. 
 To update Eigen, replace header files in include/Eigen with new header files. (http://eigen.tuxfamily.org)
